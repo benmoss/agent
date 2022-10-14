@@ -2,16 +2,34 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"sync"
 	"time"
 
+	"github.com/buildkite/agent/v3/agent/plugin"
 	"github.com/buildkite/agent/v3/api"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/sanity-io/litter"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	toolswatch "k8s.io/client-go/tools/watch"
 )
+
+type worker struct {
+	name   string
+	logger logger.Logger
+	client *kubernetes.Clientset
+}
 
 func main() {
 	log := logger.NewConsoleLogger(logger.NewTextPrinter(os.Stderr), os.Exit)
@@ -28,77 +46,201 @@ func main() {
 		cancel()
 	}()
 
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, nil)
+	clientConfig, err := kubeConfig.ClientConfig()
+	if err != nil {
+		log.Error("failed to create client config: %v", err)
+		return
+	}
+
+	// create the clientset
+	clientset, err := kubernetes.NewForConfig(clientConfig)
+	if err != nil {
+		log.Error("failed to create clienset: %v", err)
+		return
+	}
 	var wg sync.WaitGroup
-	wg.Add(2)
-	for i := 0; i < 2; i++ {
+	workers := 1
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
 		name := fmt.Sprintf("worker-%d", i)
-		go runWorker(ctx, log.WithFields(logger.StringField("worker", name)), &wg, name)
+		w := worker{
+			client: clientset,
+			logger: log.WithFields(logger.StringField("worker", name)),
+			name:   name,
+		}
+		go w.run(ctx, &wg)
 	}
 	wg.Wait()
 }
 
-func runWorker(ctx context.Context, log logger.Logger, wg *sync.WaitGroup, name string) {
+func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	client := api.NewClient(log, api.Config{
+	client := api.NewClient(w.logger, api.Config{
 		Endpoint:  "https://agent.buildkite.com/v3",
 		Token:     os.Getenv("BUILDKITE_TOKEN"),
 		UserAgent: "buildkite-agent/3.39.0.x (darwin; arm64)",
-		// DebugHTTP: true,
 	})
 	resp, _, err := client.Register(&api.AgentRegisterRequest{
-		Name: name,
+		Name: w.name,
 		OS:   "wtf",
 		Arch: "wtf",
-		// Tags: []string{"role=kaniko"},
+		Tags: []string{"queue=kubernetes"},
 	})
 	if err != nil {
-		log.Fatal("register: %v", err)
+		w.logger.Error("register: %v", err)
+		return
 	}
-	log.Info("register: %v", litter.Sdump(resp))
+	w.logger.Info("register: %v", litter.Sdump(resp))
 	client = client.FromAgentRegisterResponse(resp)
 	_, err = client.Connect()
 	if err != nil {
-		log.Fatal("connect: %v", err)
+		w.logger.Error("connect: %v", err)
+		return
 	}
 	defer client.Disconnect()
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("context cancelled: %v", ctx.Err())
+			w.logger.Error("context cancelled: %v", ctx.Err())
 			return
 		default:
+			time.Sleep(time.Second)
+			// continue
 		}
 		resp, _, err := client.Ping()
 		if err != nil {
-			log.Fatal("ping: %v", err)
+			w.logger.Error("ping: %v", err)
+			return
 		}
-		log.Info("ping: %v", litter.Sdump(resp))
-		time.Sleep(time.Second)
 		if resp.Job != nil {
 			job, _, err := client.AcceptJob(resp.Job)
 			if err != nil {
-				log.Fatal("accept: %v", err)
+				w.logger.Error("accept: %v", err)
+				return
 			}
-			log.Info("accept job: %v", litter.Sdump(job))
+			if job.State == "running" {
+				continue
+			}
 			_, err = client.StartJob(resp.Job)
 			if err != nil {
-				log.Fatal("start: %v", err)
+				w.logger.Error("start: %v", err)
 			}
-			_, err = client.UploadChunk(job.ID, &api.Chunk{
-				Data:     "heyo",
-				Sequence: 0,
-				Offset:   0,
-				Size:     len("heyo"),
-			})
+			w.logger.Info("start: %v", litter.Sdump(job))
+			plugins, err := plugin.CreateFromJSON(job.Env["BUILDKITE_PLUGINS"])
 			if err != nil {
-				log.Fatal("upload chunk: %v", err)
+				w.logger.Warn("err converting plugins to json: %v", err)
+				var env []corev1.EnvVar
+				for k, v := range job.Env {
+					env = append(env, corev1.EnvVar{Name: k, Value: v})
+				}
+				env = append(env, corev1.EnvVar{
+					Name:  "BUILDKITE_BUILD_PATH",
+					Value: "/buildkite/builds",
+				})
+				env = append(env, corev1.EnvVar{
+					Name:  "BUILDKITE_AGENT_ACCESS_TOKEN",
+					Value: client.Config().Token,
+				})
+				pod, err := w.client.CoreV1().Pods("default").Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						GenerateName: "agent-",
+					},
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyNever,
+						Containers: []corev1.Container{
+							{
+								Name:  "agent",
+								Image: "buildkite/agent:latest",
+								Args: []string{
+									"bootstrap",
+								},
+								Env: env,
+							},
+						},
+					},
+				}, metav1.CreateOptions{})
+				if err != nil {
+					w.logger.Error("failed to create pod: %v", err)
+					return
+				}
+				w.logger.Info("created pod: %s", pod.Name)
+				fs := fields.OneTermEqualSelector(metav1.ObjectNameField, pod.Name)
+				lw := &cache.ListWatch{
+					ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+						options.FieldSelector = fs.String()
+						return w.client.CoreV1().Pods(pod.Namespace).List(context.TODO(), options)
+					},
+					WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+						options.FieldSelector = fs.String()
+						return w.client.CoreV1().Pods("default").Watch(ctx, options)
+					},
+				}
+				_, err = toolswatch.UntilWithSync(ctx, lw, &corev1.Pod{}, nil, func(ev watch.Event) (bool, error) {
+					if pod, ok := ev.Object.(*corev1.Pod); ok {
+						if pod.Status.Phase == corev1.PodSucceeded {
+							w.logger.Info("pod success!")
+							return true, nil
+						}
+						w.logger.Info("pod not success! status: %s", pod.Status.Phase)
+						job.ExitStatus = "0"
+						return false, nil
+					}
+					return false, errors.New("event object not of type v1.Node")
+				})
+				if err != nil {
+					w.logger.Error("failed to watch pod: %v", err)
+					return
+				}
+				if _, err := client.FinishJob(job); err != nil {
+					w.logger.Error("failed to finish job: %v", err)
+					return
+				}
 			}
-			_, err = client.FinishJob(job)
-			if err != nil {
-				log.Fatal("finish: %v", err)
+
+			// "BUILDKITE_PLUGINS":                            "[{\"github.com/buildkite-plugins/shellcheck-buildkite-plugin\":{\"files\":[\"hooks/**\",\"lib/**\",\"commands/**\"]}}]",
+			for _, plugin := range plugins {
+				w.logger.Info("plugin: %v", litter.Sdump(plugin))
+				var podSpec corev1.PodSpec
+				asJson, err := json.Marshal(plugin.Configuration)
+				if err != nil {
+					w.logger.Error("failed to marshal config: %v", err)
+					return
+				}
+				if err := json.Unmarshal(asJson, &podSpec); err != nil {
+					w.logger.Error("failed to unmarshal config: %v", err)
+					return
+				}
+				w.logger.Info("podSpec: %v", litter.Sdump(podSpec))
 			}
+
+			// 	w.logger.Info("accept job: %v", litter.Sdump(job))
+			// 	_, err = client.StartJob(resp.Job)
+			// 	if err != nil {
+			// 		w.logger.Error("start: %v", err)
+			// 	}
+			// 	_, err = client.UploadChunk(job.ID, &api.Chunk{
+			// 		Data:     "heyo",
+			// 		Sequence: 0,
+			// 		Offset:   0,
+			// 		Size:     len("heyo"),
+			// 	})
+			// 	if err != nil {
+			// 		w.logger.Error("upload chunk: %v", err)
+			// return
+			// 	}
+			// 	_, err = client.FinishJob(job)
+			// 	if err != nil {
+			// 		w.logger.Error("finish: %v", err)
+			// return
+			// 	}
 		}
 	}
+}
+
+type Kubernetes struct {
+	Name string
 }
 
 var sampleJob = &api.Job{
