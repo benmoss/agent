@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/signal"
+	"sync"
 	"time"
 
 	"github.com/buildkite/agent/v3/api"
@@ -11,53 +15,84 @@ import (
 
 func main() {
 	log := logger.NewConsoleLogger(logger.NewTextPrinter(os.Stderr), os.Exit)
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	defer func() {
+		signal.Stop(c)
+		cancel()
+	}()
+	go func() {
+		<-c
+		cancel()
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("worker-%d", i)
+		go runWorker(ctx, log.WithFields(logger.StringField("worker", name)), &wg, name)
+	}
+	wg.Wait()
+}
+
+func runWorker(ctx context.Context, log logger.Logger, wg *sync.WaitGroup, name string) {
+	defer wg.Done()
 	client := api.NewClient(log, api.Config{
 		Endpoint:  "https://agent.buildkite.com/v3",
-		Token:     os.Getenv("TOKEN"),
+		Token:     os.Getenv("BUILDKITE_TOKEN"),
 		UserAgent: "buildkite-agent/3.39.0.x (darwin; arm64)",
 		// DebugHTTP: true,
 	})
 	resp, _, err := client.Register(&api.AgentRegisterRequest{
-		Name: "bmo",
+		Name: name,
 		OS:   "wtf",
 		Arch: "wtf",
-		Tags: []string{"role=kaniko"},
+		// Tags: []string{"role=kaniko"},
 	})
 	if err != nil {
 		log.Fatal("register: %v", err)
 	}
-	litter.Dump(resp)
+	log.Info("register: %v", litter.Sdump(resp))
 	client = client.FromAgentRegisterResponse(resp)
 	_, err = client.Connect()
 	if err != nil {
 		log.Fatal("connect: %v", err)
 	}
 	defer client.Disconnect()
-
-	for i := 0; i < 10; i++ {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("context cancelled: %v", ctx.Err())
+			return
+		default:
+		}
 		resp, _, err := client.Ping()
 		if err != nil {
 			log.Fatal("ping: %v", err)
 		}
-		litter.Dump(resp)
+		log.Info("ping: %v", litter.Sdump(resp))
 		time.Sleep(time.Second)
 		if resp.Job != nil {
 			job, _, err := client.AcceptJob(resp.Job)
 			if err != nil {
 				log.Fatal("accept: %v", err)
 			}
-			litter.Dump(job)
+			log.Info("accept job: %v", litter.Sdump(job))
 			_, err = client.StartJob(resp.Job)
 			if err != nil {
 				log.Fatal("start: %v", err)
 			}
-			client.UploadChunk(job.ID, &api.Chunk{
+			_, err = client.UploadChunk(job.ID, &api.Chunk{
 				Data:     "heyo",
 				Sequence: 0,
 				Offset:   0,
 				Size:     len("heyo"),
 			})
-			time.Sleep(5 * time.Minute)
+			if err != nil {
+				log.Fatal("upload chunk: %v", err)
+			}
 			_, err = client.FinishJob(job)
 			if err != nil {
 				log.Fatal("finish: %v", err)
