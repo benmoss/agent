@@ -33,6 +33,26 @@ type worker struct {
 	client *kubernetes.Clientset
 }
 
+const ns = "default"
+
+var defaultBootstrapPod = &corev1.Pod{
+	ObjectMeta: metav1.ObjectMeta{
+		GenerateName: "agent-",
+	},
+	Spec: corev1.PodSpec{
+		RestartPolicy: corev1.RestartPolicyNever,
+		Containers: []corev1.Container{
+			{
+				Name:  "agent",
+				Image: "buildkite/agent:latest",
+				Args: []string{
+					"bootstrap",
+				},
+			},
+		},
+	},
+}
+
 func main() {
 	log := logger.NewConsoleLogger(logger.NewTextPrinter(os.Stderr), os.Exit)
 	ctx := context.Background()
@@ -84,18 +104,15 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 		Token:     os.Getenv("BUILDKITE_TOKEN"),
 		UserAgent: "buildkite-agent/3.39.0.x (darwin; arm64)",
 	})
-	resp, _, err := client.Register(&api.AgentRegisterRequest{
+	registerResp, _, err := client.Register(&api.AgentRegisterRequest{
 		Name: w.name,
-		OS:   "wtf",
-		Arch: "wtf",
 		Tags: []string{"queue=kubernetes"},
 	})
 	if err != nil {
 		w.logger.Error("register: %v", err)
 		return
 	}
-	w.logger.Info("register: %v", litter.Sdump(resp))
-	client = client.FromAgentRegisterResponse(resp)
+	client = client.FromAgentRegisterResponse(registerResp)
 	_, err = client.Connect()
 	if err != nil {
 		w.logger.Error("connect: %v", err)
@@ -108,13 +125,13 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 			w.logger.Error("context cancelled: %v", ctx.Err())
 			return
 		default:
-			time.Sleep(time.Second)
+			time.Sleep(time.Duration(registerResp.PingInterval) * time.Second)
 			// continue
 		}
 		resp, _, err := client.Ping()
 		if err != nil {
-			w.logger.Error("ping: %v", err)
-			return
+			w.logger.Warn("ping: %v", err)
+			continue
 		}
 		if resp.Job != nil {
 			job, _, err := client.AcceptJob(resp.Job)
@@ -135,7 +152,7 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				w.logger.Error("podFromJob: %v", err)
 				return
 			}
-			pod, err = w.client.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{})
+			pod, err = w.client.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 			if err != nil {
 				w.logger.Error("failed to create pod: %v", err)
 				return
@@ -149,7 +166,7 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				},
 				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 					options.FieldSelector = fs.String()
-					return w.client.CoreV1().Pods("default").Watch(ctx, options)
+					return w.client.CoreV1().Pods(ns).Watch(ctx, options)
 				},
 			}
 			_, err = toolswatch.UntilWithSync(ctx, lw, &corev1.Pod{}, nil, func(ev watch.Event) (bool, error) {
@@ -166,10 +183,6 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 			})
 			if err != nil {
 				w.logger.Error("failed to watch pod: %v", err)
-				return
-			}
-			if _, err := client.FinishJob(job); err != nil {
-				w.logger.Error("failed to finish job: %v", err)
 				return
 			}
 			req := w.client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{})
@@ -197,14 +210,14 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				w.logger.Error("upload chunk: %v", err)
 				return
 			}
-
-			if err := w.client.CoreV1().Pods("default").Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
-				w.logger.Error("delete pod: %v", err)
+			if _, err := client.FinishJob(job); err != nil {
+				w.logger.Error("failed to finish job: %v", err)
 				return
 			}
 		}
 	}
 }
+
 func (w *worker) podFromJob(job *api.Job, client *api.Client) (*corev1.Pod, error) {
 	var pod *corev1.Pod
 	if job.Env["BUILDKITE_PLUGINS"] == "" {
@@ -280,22 +293,4 @@ func (w *worker) podFromJob(job *api.Job, client *api.Client) (*corev1.Pod, erro
 		pod.Spec.InitContainers[i] = c
 	}
 	return pod, nil
-}
-
-var defaultBootstrapPod = &corev1.Pod{
-	ObjectMeta: metav1.ObjectMeta{
-		GenerateName: "agent-",
-	},
-	Spec: corev1.PodSpec{
-		RestartPolicy: corev1.RestartPolicyNever,
-		Containers: []corev1.Container{
-			{
-				Name:  "agent",
-				Image: "buildkite/agent:latest",
-				Args: []string{
-					"bootstrap",
-				},
-			},
-		},
-	},
 }
