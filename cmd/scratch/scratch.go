@@ -152,6 +152,7 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				w.logger.Error("podFromJob: %v", err)
 				return
 			}
+			w.logger.Info("podSpec: %v", litter.Sdump(pod))
 			pod, err = w.client.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 			if err != nil {
 				w.logger.Error("failed to create pod: %v", err)
@@ -240,7 +241,6 @@ func (w *worker) podFromJob(job *api.Job, client *api.Client) (*corev1.Pod, erro
 				if err := json.Unmarshal(asJson, &podSpec); err != nil {
 					return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 				}
-				w.logger.Info("podSpec: %v", litter.Sdump(podSpec))
 				pod = &corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fmt.Sprintf("buildkite-%s", job.ID),
@@ -251,13 +251,13 @@ func (w *worker) podFromJob(job *api.Job, client *api.Client) (*corev1.Pod, erro
 		}
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, corev1.Container{
+	pod.Spec.InitContainers = append([]corev1.Container{{
 		Name:  "bootstrap",
 		Image: "buildkite/agent:latest",
 		Args: []string{
 			"bootstrap", "--phases=checkout",
 		},
-	})
+	}}, pod.Spec.InitContainers...)
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 		Name: "workspace",
 		VolumeSource: corev1.VolumeSource{
@@ -276,21 +276,22 @@ func (w *worker) podFromJob(job *api.Job, client *api.Client) (*corev1.Pod, erro
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
 	}
 	volumeMounts := []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace"}}
-	for i, c := range pod.Spec.Containers {
+	massageContainers := func(name string, containers []corev1.Container, c corev1.Container, i int) {
 		c.Env = append(c.Env, env...)
 		if c.Name == "" {
-			c.Name = fmt.Sprintf("container-%d", i)
+			c.Name = fmt.Sprintf("%s-%d", name, i)
+		}
+		if c.WorkingDir == "" {
+			c.WorkingDir = "/workspace"
 		}
 		c.VolumeMounts = append(c.VolumeMounts, volumeMounts...)
-		pod.Spec.Containers[i] = c
+		containers[i] = c
+	}
+	for i, c := range pod.Spec.Containers {
+		massageContainers("container", pod.Spec.Containers, c, i)
 	}
 	for i, c := range pod.Spec.InitContainers {
-		c.Env = append(c.Env, env...)
-		if c.Name == "" {
-			c.Name = fmt.Sprintf("container-%d", i)
-		}
-		c.VolumeMounts = append(c.VolumeMounts, volumeMounts...)
-		pod.Spec.InitContainers[i] = c
+		massageContainers("init", pod.Spec.InitContainers, c, i)
 	}
 	return pod, nil
 }
