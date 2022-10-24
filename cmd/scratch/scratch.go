@@ -1,36 +1,62 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"sync"
 	"time"
 
+	"github.com/boz/go-logutil"
+	logutil_logrus "github.com/boz/go-logutil/logrus"
+	"github.com/boz/kail"
+	"github.com/boz/kcache/nsname"
 	"github.com/buildkite/agent/v3/agent/plugin"
 	"github.com/buildkite/agent/v3/api"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/sanity-io/litter"
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	toolswatch "k8s.io/client-go/tools/watch"
 )
 
 type worker struct {
-	name   string
-	logger logger.Logger
-	client *kubernetes.Clientset
+	name         string
+	logger       logger.Logger
+	client       *kubernetes.Clientset
+	clientConfig *rest.Config
+}
+
+// Write implements io.Writer
+type jobWriter struct {
+	client   *api.Client
+	id       string
+	offset   int
+	sequence int
+}
+
+func (j *jobWriter) Write(p []byte) (int, error) {
+	j.sequence += 1
+	_, err := j.client.UploadChunk(j.id, &api.Chunk{
+		Data:     string(p),
+		Sequence: j.sequence,
+		Offset:   j.offset,
+		Size:     len(p),
+	})
+	j.offset += len(p)
+	return len(p), err
 }
 
 const ns = "default"
@@ -56,6 +82,9 @@ var defaultBootstrapPod = &corev1.Pod{
 func main() {
 	log := logger.NewConsoleLogger(logger.NewTextPrinter(os.Stderr), os.Exit)
 	ctx := context.Background()
+	parent := logrus.New()
+	parent.Level = logrus.InfoLevel
+	ctx = logutil.NewContext(ctx, logutil_logrus.New(parent))
 	ctx, cancel := context.WithCancel(ctx)
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
@@ -88,9 +117,10 @@ func main() {
 	for i := 0; i < workers; i++ {
 		name := fmt.Sprintf("worker-%d", i)
 		w := worker{
-			client: clientset,
-			logger: log.WithFields(logger.StringField("worker", name)),
-			name:   name,
+			client:       clientset,
+			clientConfig: clientConfig,
+			logger:       log.WithFields(logger.StringField("worker", name)),
+			name:         name,
 		}
 		go w.run(ctx, &wg)
 	}
@@ -155,10 +185,59 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 			w.logger.Info("podSpec: %v", litter.Sdump(pod))
 			pod, err = w.client.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 			if err != nil {
-				w.logger.Error("failed to create pod: %v", err)
-				return
+				msg := fmt.Sprintf("failed to create pod: %v", err)
+				if _, err := client.UploadChunk(job.ID, &api.Chunk{
+					Data:     msg,
+					Sequence: 0,
+					Offset:   0,
+					Size:     len(msg),
+				}); err != nil {
+					w.logger.Error("failed to log: %v", err)
+					return
+				}
+				if _, err = client.FinishJob(job); err != nil {
+					w.logger.Error("failed to finish job: %v", err)
+					return
+				}
 			}
 			w.logger.Info("created pod: %s", pod.Name)
+			ds, err := kail.NewDSBuilder().WithPods(nsname.ForObject(pod)).Create(ctx, w.client)
+			if err != nil {
+				w.logger.Error("failed to create log filter: %v", err)
+			}
+			select {
+			case <-ds.Ready():
+			case <-ds.Done():
+				w.logger.Error("Unable to initialize data source")
+				return
+			}
+			controller, err := kail.NewController(ctx, w.client, w.clientConfig, ds.Pods(), kail.NewContainerFilter([]string{}), 1*time.Second)
+			if err != nil {
+				w.logger.Error("failed to create kail controller: %v", err)
+				return
+			}
+			buffered := bufio.NewWriter(&jobWriter{
+				client: client,
+				id:     job.ID,
+			})
+			writer := kail.NewWriter(buffered)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tick := time.NewTicker(time.Second)
+				for {
+					select {
+					case <-tick.C:
+						buffered.Flush()
+					case ev := <-controller.Events():
+						writer.Print(ev)
+					case <-controller.Done():
+						buffered.Flush()
+						return
+					}
+				}
+			}()
 			fs := fields.OneTermEqualSelector(metav1.ObjectNameField, pod.Name)
 			lw := &cache.ListWatch{
 				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
@@ -186,31 +265,8 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				w.logger.Error("failed to watch pod: %v", err)
 				return
 			}
-			req := w.client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{})
-			podLogs, err := req.Stream(ctx)
-			if err != nil {
-				w.logger.Error("error in opening stream: %v", err)
-				return
-			}
-			defer podLogs.Close()
+			controller.Close()
 
-			buf := new(bytes.Buffer)
-			_, err = io.Copy(buf, podLogs)
-			if err != nil {
-				w.logger.Error("error in copy information from podLogs to buf: %v", err)
-				return
-			}
-			str := buf.String()
-			_, err = client.UploadChunk(job.ID, &api.Chunk{
-				Data:     str,
-				Sequence: 0,
-				Offset:   0,
-				Size:     len(str),
-			})
-			if err != nil {
-				w.logger.Error("upload chunk: %v", err)
-				return
-			}
 			if _, err := client.FinishJob(job); err != nil {
 				w.logger.Error("failed to finish job: %v", err)
 				return
