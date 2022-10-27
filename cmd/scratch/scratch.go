@@ -156,6 +156,7 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 			pod, err = w.client.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 			if err != nil {
 				w.logger.Error("failed to create pod: %v", err)
+				// TODO: log failure to buildkite, dont exit
 				return
 			}
 			w.logger.Info("created pod: %s", pod.Name)
@@ -186,6 +187,7 @@ func (w *worker) run(ctx context.Context, wg *sync.WaitGroup) {
 				w.logger.Error("failed to watch pod: %v", err)
 				return
 			}
+			// TODO: stream logs as containers run
 			req := w.client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{})
 			podLogs, err := req.Stream(ctx)
 			if err != nil {
