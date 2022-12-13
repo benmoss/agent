@@ -82,7 +82,16 @@ func (b *Bootstrap) Run(ctx context.Context) (exitCode int) {
 	var kubernetesClient kubernetes.Client
 	if experiments.IsEnabled("kubernetes-exec") {
 		b.shell.Commentf("Using experimental Kubernetes support")
-		err := roko.NewRetrier(
+
+		path := os.Getenv("PATH")
+		ex, err := os.Executable()
+		if err != nil {
+			b.shell.Errorf("Error getting executable path: %v", err)
+			return -1
+		}
+		os.Setenv("PATH", fmt.Sprintf("%s%s%s", path, string(os.PathListSeparator), filepath.Dir(ex)))
+
+		err = roko.NewRetrier(
 			roko.WithMaxAttempts(7),
 			roko.WithStrategy(roko.Exponential(2*time.Second, 0)),
 		).Do(func(rtr *roko.Retrier) error {
@@ -91,28 +100,54 @@ func (b *Bootstrap) Run(ctx context.Context) (exitCode int) {
 				return fmt.Errorf("failed to parse container id, %s", os.Getenv("BUILDKITE_CONTAINER_ID"))
 			}
 			kubernetesClient.ID = id
-			if err := kubernetesClient.Connect(); err != nil {
+			connect, err := kubernetesClient.Connect()
+			if err != nil {
 				return err
 			}
-			writer := io.MultiWriter(os.Stdout, &kubernetesClient)
-			b.shell.Writer = writer
-			b.shell.Logger = &shell.WriterLogger{
-				Writer: writer,
-				Ansi:   true,
-			}
+			os.Setenv("BUILDKITE_AGENT_ACCESS_TOKEN", connect.AccessToken)
+			b.shell.Env.Set("BUILDKITE_AGENT_ACCESS_TOKEN", connect.AccessToken)
 			return nil
 		})
 		if err != nil {
 			b.shell.Errorf("Error connecting to kubernetes runner: %v", err)
 			return 1
 		}
-		status := <-kubernetesClient.WaitReady()
-		if status.Err != nil {
+		if kubernetesClient.IsSidecar() {
+			b.shell.Commentf("Logging to tmp file")
+			imageName := os.Getenv("BUILDKITE_IMAGE_NAME")
+			imageName = strings.ReplaceAll(imageName, string(os.PathSeparator), "-")
+			imageName = strings.ReplaceAll(imageName, ":", "-")
+			imageName = fmt.Sprintf("%s.log", imageName)
+			f, err := os.Create(filepath.Join(os.TempDir(), imageName))
+			if err != nil {
+				b.shell.Errorf("Error creating sidecar log file: %v", err)
+				return -1
+			}
+			defer f.Close()
+			b.AutomaticArtifactUploadPaths = filepath.Join(b.AutomaticArtifactUploadPaths, f.Name())
+			b.shell.Writer = io.MultiWriter(os.Stdout, f)
+			b.shell.Logger = &shell.WriterLogger{
+				Writer: io.MultiWriter(os.Stdout, f),
+				Ansi:   false,
+			}
+		} else {
+			writer := io.MultiWriter(os.Stdout, &kubernetesClient)
+			b.shell.Writer = writer
+			b.shell.Logger = &shell.WriterLogger{
+				Writer: writer,
+				Ansi:   true,
+			}
+		}
+		if err := kubernetesClient.AwaitRunState(kubernetes.RunStateGo); err != nil {
 			b.shell.Errorf("Error waiting for client to become ready: %v", err)
 			return 1
 		}
-		os.Setenv("BUILDKITE_AGENT_ACCESS_TOKEN", status.AccessToken)
-		b.shell.Env.Set("BUILDKITE_AGENT_ACCESS_TOKEN", status.AccessToken)
+		go func() {
+			if err := kubernetesClient.AwaitRunState(kubernetes.RunStateTerminate); err != nil {
+				b.shell.Errorf("Error waiting for termination: %v", err)
+			}
+			b.cancelCh <- struct{}{}
+		}()
 		defer func() {
 			kubernetesClient.Exit(b.shell.WaitStatus())
 		}()

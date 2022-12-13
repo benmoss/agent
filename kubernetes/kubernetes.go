@@ -21,9 +21,15 @@ import (
 
 func init() {
 	gob.Register(new(syscall.WaitStatus))
+	// gob.Register(new(RunState))
 }
 
-const defaultSocketPath = "/workspace/buildkite.sock"
+const (
+	defaultSocketPath = "/workspace/buildkite.sock"
+
+	checkoutContainerID = 0
+	commandContainerID  = 1
+)
 
 func New(l logger.Logger, c Config) *Runner {
 	if c.SocketPath == "" {
@@ -70,6 +76,14 @@ const (
 	stateExited
 )
 
+func (c clientResult) Connected() bool {
+	return c.State == stateConnected || c.State == stateExited
+}
+
+func (c clientResult) Exited() bool {
+	return c.State == stateExited
+}
+
 type Config struct {
 	SocketPath     string
 	ClientCount    int
@@ -77,6 +91,7 @@ type Config struct {
 	AccessToken    string
 }
 
+// Starts the Runner, listening for RPC messages on the socket
 func (r *Runner) Run(ctx context.Context) error {
 	r.server.Register(r)
 	r.mux.Handle(rpc.DefaultRPCPath, r.server)
@@ -94,6 +109,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
+// Returns whether the Runner has been started
 func (r *Runner) Started() <-chan struct{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -101,6 +117,7 @@ func (r *Runner) Started() <-chan struct{} {
 	return r.started
 }
 
+// Returns whether the Runner has completed
 func (r *Runner) Done() <-chan struct{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -121,18 +138,14 @@ func (r *Runner) Terminate() error {
 }
 
 func (r *Runner) WaitStatus() process.WaitStatus {
-	var ws process.WaitStatus
-	for _, client := range r.clients {
-		if client.ExitStatus.ExitStatus() != 0 {
-			return client.ExitStatus
-		}
-		if client.ExitStatus.Signaled() {
-			return client.ExitStatus
-		}
-		// just return any ExitStatus if we don't find any "interesting" ones
-		ws = client.ExitStatus
+	// if bootstrap failed, return that
+	bootstrap := r.clients[checkoutContainerID]
+	if bootstrap.ExitStatus != nil && bootstrap.ExitStatus.ExitStatus() != 0 {
+		return bootstrap.ExitStatus
 	}
-	return ws
+
+	// otherwise return command's exit
+	return r.clients[commandContainerID].ExitStatus
 }
 
 // ==== sidecar api ====
@@ -147,15 +160,19 @@ type ExitCode struct {
 	ExitStatus process.WaitStatus
 }
 
-type Status struct {
-	Ready       bool
+type RegisterResponse struct {
 	AccessToken string
 }
 
+type RunState string
+
+const (
+	RunStateWait      RunState = "wait"
+	RunStateGo        RunState = "go"
+	RunStateTerminate RunState = "terminate"
+)
+
 func (r *Runner) WriteLogs(args Logs, reply *Empty) error {
-	r.startedOnce.Do(func() {
-		close(r.started)
-	})
 	_, err := io.Copy(r.conf.Stdout, bytes.NewReader(args.Data))
 	return err
 }
@@ -171,11 +188,6 @@ func (r *Runner) Exit(args ExitCode, reply *Empty) error {
 	r.logger.Info("client %d exited with code %d", args.ID, args.ExitStatus.ExitStatus())
 	client.ExitStatus = args.ExitStatus
 	client.State = stateExited
-	if client.ExitStatus.ExitStatus() != 0 {
-		r.closedOnce.Do(func() {
-			close(r.done)
-		})
-	}
 
 	allExited := true
 	for _, client := range r.clients {
@@ -189,30 +201,70 @@ func (r *Runner) Exit(args ExitCode, reply *Empty) error {
 	return nil
 }
 
-func (r *Runner) Register(id int, reply *Empty) error {
+func (r *Runner) Register(id int, reply *RegisterResponse) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.startedOnce.Do(func() {
+		close(r.started)
+	})
 	client, found := r.clients[id]
 	if !found {
 		return fmt.Errorf("client id %d not found", id)
 	}
-	if client.State == stateConnected {
+	if client.Connected() {
 		return fmt.Errorf("client id %d already registered", id)
 	}
+	r.logger.Info("client %d connected", id)
 	client.State = stateConnected
+	reply.AccessToken = r.conf.AccessToken
 	return nil
 }
 
-func (r *Runner) Status(id int, reply *Status) error {
+func (r *Runner) Status(id int, reply *RunState) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	reply.AccessToken = r.conf.AccessToken
 
-	if id == 0 {
-		reply.Ready = true
-	} else if client, found := r.clients[id-1]; found && client.State == stateExited {
-		reply.Ready = true
+	switch id {
+	case checkoutContainerID:
+		*reply = RunStateGo
+	case commandContainerID:
+		ready := true
+	Out:
+		for id, client := range r.clients {
+			switch id {
+			case commandContainerID:
+				continue
+			case checkoutContainerID:
+				if !client.Exited() {
+					ready = false
+					break Out
+				}
+			default:
+				if !client.Connected() {
+					ready = false
+					break Out
+				}
+			}
+		}
+		if ready {
+			*reply = RunStateGo
+		} else {
+			*reply = RunStateWait
+		}
+	default:
+		if _, found := r.clients[id]; found {
+			if r.clients[commandContainerID].Exited() {
+				*reply = RunStateTerminate
+			} else if r.clients[checkoutContainerID].Exited() {
+				*reply = RunStateGo
+			} else {
+				*reply = RunStateWait
+			}
+		} else {
+			return fmt.Errorf("client id %d not found", id)
+		}
 	}
+	r.logger.Info("client %d ping, state: %s", id, *reply)
 	return nil
 }
 
@@ -224,16 +276,20 @@ type Client struct {
 
 var errNotConnected = errors.New("client not connected")
 
-func (c *Client) Connect() error {
+func (c *Client) Connect() (RegisterResponse, error) {
 	if c.SocketPath == "" {
 		c.SocketPath = defaultSocketPath
 	}
 	client, err := rpc.DialHTTP("unix", c.SocketPath)
 	if err != nil {
-		return err
+		return RegisterResponse{}, err
 	}
 	c.client = client
-	return c.client.Call("Runner.Register", c.ID, nil)
+	var resp RegisterResponse
+	if err := c.client.Call("Runner.Register", c.ID, &resp); err != nil {
+		return RegisterResponse{}, err
+	}
+	return resp, nil
 }
 
 func (c *Client) Exit(exitStatus process.WaitStatus) error {
@@ -251,6 +307,9 @@ func (c *Client) Write(p []byte) (int, error) {
 	if c.client == nil {
 		return 0, errNotConnected
 	}
+	if c.ID != checkoutContainerID && c.ID != commandContainerID {
+		return 0, nil
+	}
 	n := len(p)
 	err := c.client.Call("Runner.WriteLogs", Logs{
 		Data: p,
@@ -258,31 +317,27 @@ func (c *Client) Write(p []byte) (int, error) {
 	return n, err
 }
 
-type WaitReadyResponse struct {
-	Err error
-	Status
-}
-
-func (c *Client) WaitReady() <-chan WaitReadyResponse {
-	result := make(chan WaitReadyResponse)
-	go func() {
-		for {
-			var reply Status
-			if err := c.client.Call("Runner.Status", c.ID, &reply); err != nil {
-				result <- WaitReadyResponse{Err: err}
-				return
+func (c *Client) AwaitRunState(desiredState RunState) error {
+	for {
+		var current RunState
+		if err := c.client.Call("Runner.Status", c.ID, &current); err != nil {
+			if desiredState == RunStateTerminate && errors.Is(err, rpc.ErrShutdown) {
+				return nil
 			}
-			if reply.Ready {
-				result <- WaitReadyResponse{Status: reply}
-				return
-			}
-			// TODO: configurable interval
+			return err
+		}
+		if current == desiredState {
+			return nil
+		} else {
 			time.Sleep(time.Second)
 		}
-	}()
-	return result
+	}
 }
 
 func (c *Client) Close() {
 	c.client.Close()
+}
+
+func (c *Client) IsSidecar() bool {
+	return c.ID > commandContainerID
 }

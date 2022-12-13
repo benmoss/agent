@@ -14,74 +14,79 @@ import (
 )
 
 func TestOrderedClients(t *testing.T) {
-	runner := newRunner(t, 3)
+	runner := newRunner(t, 4)
 	socketPath := runner.conf.SocketPath
 
-	client0 := &Client{ID: 0}
-	client1 := &Client{ID: 1}
-	client2 := &Client{ID: 2}
-	clients := []*Client{client0, client1, client2}
+	checkout := &Client{ID: checkoutContainerID, SocketPath: socketPath}
+	command := &Client{ID: commandContainerID, SocketPath: socketPath}
+	sidecar1 := &Client{ID: 2, SocketPath: socketPath}
+	sidecar2 := &Client{ID: 3, SocketPath: socketPath}
 
-	// wait for runner to listen
+	t.Log("waiting for runner to listen")
 	require.Eventually(t, func() bool {
 		_, err := os.Lstat(socketPath)
 		return err == nil
 
 	}, time.Second*10, time.Millisecond, "expected socket file to exist")
 
-	for _, client := range clients {
-		client.SocketPath = socketPath
-		require.NoError(t, client.Connect())
+	// command should not start until other clients connect
+	var runState RunState
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, runState, RunStateWait)
+
+	// sidecars should not start until after checkout
+	require.NoError(t, runner.Status(sidecar1.ID, &runState))
+	require.Equal(t, runState, RunStateWait)
+	require.NoError(t, runner.Status(sidecar2.ID, &runState))
+	require.Equal(t, runState, RunStateWait)
+
+	// checkout should be ready immediately
+	require.NoError(t, runner.Status(checkout.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+
+	// connect checkout
+	_, err := checkout.Connect()
+	require.NoError(t, err)
+	t.Cleanup(checkout.Close)
+
+	// mark checkout exit successful
+	require.NoError(t, checkout.Exit(waitStatusSuccess))
+
+	// sidecars should be ready after checkout exits
+	require.NoError(t, runner.Status(sidecar1.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+	require.NoError(t, runner.Status(sidecar2.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+
+	// connect sidecars
+	for _, client := range []*Client{sidecar1, sidecar2} {
+		_, err := client.Connect()
+		require.NoError(t, err)
 		t.Cleanup(client.Close)
 	}
-	select {
-	case err := <-client0.WaitReady():
-		require.NoError(t, err.Err)
-		break
-	case err := <-client1.WaitReady():
-		require.NoError(t, err.Err)
-		require.FailNow(t, "client1 should not be ready")
-	case err := <-client2.WaitReady():
-		require.NoError(t, err.Err)
-		require.FailNow(t, "client2 should not be ready")
-	case <-runner.Done():
-		require.FailNow(t, "runner should not be done")
-	case <-time.After(time.Second):
-		require.FailNow(t, "client0 should be ready")
-	}
 
-	require.NoError(t, client0.Exit(waitStatusSuccess))
-	select {
-	case err := <-client1.WaitReady():
-		require.NoError(t, err.Err)
-		break
-	case err := <-client2.WaitReady():
-		require.NoError(t, err.Err)
-		require.FailNow(t, "client2 should not be ready")
-	case <-runner.Done():
-		require.FailNow(t, "runner should not be done")
-	case <-time.After(time.Second):
-		require.FailNow(t, "client1 should be ready")
-	}
+	// connect command
+	_, err = command.Connect()
+	require.NoError(t, err)
+	t.Cleanup(command.Close)
 
-	require.NoError(t, client1.Exit(waitStatusSuccess))
-	select {
-	case err := <-client2.WaitReady():
-		require.NoError(t, err.Err)
-		break
-	case <-runner.Done():
-		require.FailNow(t, "runner should not be done")
-	case <-time.After(time.Second):
-		require.FailNow(t, "client2 should be ready")
-	}
+	t.Log("command should be ready after sidecar connects")
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+	require.NoError(t, command.AwaitRunState(RunStateGo))
 
-	require.NoError(t, client2.Exit(waitStatusSuccess))
-	select {
-	case <-runner.Done():
-		break
-	case <-time.After(time.Second):
-		require.FailNow(t, "runner should be done when all clients have exited")
-	}
+	// after command exits other clients should be terminated
+	require.NoError(t, command.Exit(waitStatusSuccess))
+
+	t.Log("Waiting for sidecar1 to be in RunStateTerminate")
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+	require.NoError(t, sidecar1.AwaitRunState(RunStateTerminate))
+
+	t.Log("Waiting for sidecar2 to be in RunStateTerminate")
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, runState, RunStateGo)
+	require.NoError(t, sidecar1.AwaitRunState(RunStateTerminate))
 }
 
 func TestDuplicateClients(t *testing.T) {
@@ -98,46 +103,67 @@ func TestDuplicateClients(t *testing.T) {
 
 	}, time.Second*10, time.Millisecond, "expected socket file to exist")
 
-	require.NoError(t, client0.Connect())
-	require.Error(t, client1.Connect(), "expected an error when connecting a client with a duplicate ID")
+	_, err := client0.Connect()
+	require.NoError(t, err)
+	_, err = client1.Connect()
+	require.Error(t, err)
 }
 
 func TestExcessClients(t *testing.T) {
 	runner := newRunner(t, 1)
 	socketPath := runner.conf.SocketPath
 
-	client0 := Client{ID: 0, SocketPath: socketPath}
-	client1 := Client{ID: 1, SocketPath: socketPath}
+	client0 := Client{ID: checkoutContainerID, SocketPath: socketPath}
+	client1 := Client{ID: commandContainerID, SocketPath: socketPath}
 
-	require.NoError(t, client0.Connect())
-	require.Error(t, client1.Connect(), "expected an error when connecting too many clients")
+	_, err := client0.Connect()
+	require.NoError(t, err)
+	_, err = client1.Connect()
+	require.Error(t, err)
 }
 
 func TestWaitStatusNonZero(t *testing.T) {
 	runner := newRunner(t, 2)
 
-	client0 := Client{ID: 0, SocketPath: runner.conf.SocketPath}
-	client1 := Client{ID: 1, SocketPath: runner.conf.SocketPath}
+	bootstrap := Client{ID: checkoutContainerID, SocketPath: runner.conf.SocketPath}
+	command := Client{ID: commandContainerID, SocketPath: runner.conf.SocketPath}
 
-	require.NoError(t, client0.Connect())
-	require.NoError(t, client1.Connect())
-	require.NoError(t, client0.Exit(waitStatusFailure))
-	require.NoError(t, client1.Exit(waitStatusSuccess))
+	_, err := bootstrap.Connect()
+	require.NoError(t, err)
+	_, err = command.Connect()
+	require.NoError(t, err)
+	require.NoError(t, bootstrap.Exit(waitStatusFailure))
+	require.NoError(t, command.Exit(waitStatusSuccess))
 	require.Equal(t, runner.WaitStatus().ExitStatus(), 1)
 }
 
-func TestWaitStatusSignaled(t *testing.T) {
-	runner := newRunner(t, 2)
-
-	client0 := Client{ID: 0, SocketPath: runner.conf.SocketPath}
-	client1 := Client{ID: 1, SocketPath: runner.conf.SocketPath}
-
-	require.NoError(t, client0.Connect())
-	require.NoError(t, client1.Connect())
-	require.NoError(t, client0.Exit(waitStatusSignaled))
-	require.NoError(t, client1.Exit(waitStatusSuccess))
-	require.Equal(t, runner.WaitStatus().ExitStatus(), 0)
-	require.True(t, runner.WaitStatus().Signaled())
+func TestDoneAfterAllClientsExit(t *testing.T) {
+	containers := 4
+	runner := newRunner(t, containers)
+	select {
+	case <-runner.Done():
+		t.Fatal("runner should not be done")
+	default:
+		// success
+	}
+	for i := 0; i < containers; i++ {
+		require.NoError(t, runner.Exit(ExitCode{ID: i, ExitStatus: waitStatusSuccess}, nil))
+		if i == containers-1 {
+			select {
+			case <-runner.Done():
+				// success
+			default:
+				t.Fatal("runner should be done")
+			}
+		} else {
+			select {
+			case <-runner.Done():
+				t.Fatalf("runner should not be done, i: %d", i)
+			default:
+				// success
+			}
+		}
+	}
 }
 
 func newRunner(t *testing.T, clientCount int) *Runner {
