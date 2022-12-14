@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/buildkite/agent/v3/agent"
 	"github.com/buildkite/agent/v3/agent/plugin"
 	"github.com/buildkite/agent/v3/bootstrap/shell"
 	"github.com/buildkite/agent/v3/env"
@@ -124,7 +125,7 @@ func (b *Bootstrap) Run(ctx context.Context) (exitCode int) {
 				return -1
 			}
 			defer f.Close()
-			b.AutomaticArtifactUploadPaths = filepath.Join(b.AutomaticArtifactUploadPaths, f.Name())
+			b.AutomaticArtifactUploadPaths = strings.Join([]string{b.AutomaticArtifactUploadPaths, f.Name()}, agent.ArtifactPathDelimiter)
 			b.shell.Writer = io.MultiWriter(os.Stdout, f)
 			b.shell.Logger = &shell.WriterLogger{
 				Writer: io.MultiWriter(os.Stdout, f),
