@@ -143,7 +143,7 @@ func (b *Bootstrap) Run(ctx context.Context) (exitCode int) {
 			return 1
 		}
 		go func() {
-			if err := kubernetesClient.AwaitRunState(kubernetes.RunStateTerminate); err != nil {
+			if err := kubernetesClient.AwaitRunState(kubernetes.RunStateInterrupt); err != nil {
 				b.shell.Errorf("Error waiting for termination: %v", err)
 			}
 			b.cancelCh <- struct{}{}

@@ -81,12 +81,12 @@ func TestOrderedClients(t *testing.T) {
 	t.Log("Waiting for sidecar1 to be in RunStateTerminate")
 	require.NoError(t, runner.Status(command.ID, &runState))
 	require.Equal(t, runState, RunStateGo)
-	require.NoError(t, sidecar1.AwaitRunState(RunStateTerminate))
+	require.NoError(t, sidecar1.AwaitRunState(RunStateInterrupt))
 
 	t.Log("Waiting for sidecar2 to be in RunStateTerminate")
 	require.NoError(t, runner.Status(command.ID, &runState))
 	require.Equal(t, runState, RunStateGo)
-	require.NoError(t, sidecar1.AwaitRunState(RunStateTerminate))
+	require.NoError(t, sidecar1.AwaitRunState(RunStateInterrupt))
 }
 
 func TestDuplicateClients(t *testing.T) {
@@ -164,6 +164,54 @@ func TestDoneAfterAllClientsExit(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestInterruptAndTerminate(t *testing.T) {
+	runner := newRunner(t, 2)
+
+	bootstrap := Client{ID: checkoutContainerID, SocketPath: runner.conf.SocketPath}
+	command := Client{ID: commandContainerID, SocketPath: runner.conf.SocketPath}
+
+	// connect both clients
+	_, err := bootstrap.Connect()
+	require.NoError(t, err)
+	_, err = command.Connect()
+	require.NoError(t, err)
+
+	// assert initial run states
+	var runState RunState
+	require.NoError(t, runner.Status(bootstrap.ID, &runState))
+	require.Equal(t, RunStateGo, runState)
+	require.NoError(t, bootstrap.AwaitRunState(RunStateGo))
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, RunStateWait, runState)
+	require.NoError(t, command.AwaitRunState(RunStateWait))
+
+	// interrupt
+	require.NoError(t, runner.Interrupt())
+
+	// assert they are now both in terminate
+	require.NoError(t, runner.Status(bootstrap.ID, &runState))
+	require.Equal(t, RunStateInterrupt, runState)
+	require.NoError(t, bootstrap.AwaitRunState(RunStateInterrupt))
+	require.NoError(t, runner.Status(command.ID, &runState))
+	require.Equal(t, RunStateInterrupt, runState)
+	require.NoError(t, command.AwaitRunState(RunStateInterrupt))
+
+	// terminate
+	require.NoError(t, runner.Terminate())
+
+	// assert runner is done
+	select {
+	case <-runner.Done():
+		// success
+	default:
+		t.Fatal("runner should be done")
+	}
+
+	// assert clients terminate
+	require.Error(t, bootstrap.AwaitRunState(RunStateGo))
+	require.Error(t, command.AwaitRunState(RunStateInterrupt))
 }
 
 func newRunner(t *testing.T, clientCount int) *Runner {

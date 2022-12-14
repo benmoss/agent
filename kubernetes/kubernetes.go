@@ -21,7 +21,6 @@ import (
 
 func init() {
 	gob.Register(new(syscall.WaitStatus))
-	// gob.Register(new(RunState))
 }
 
 const (
@@ -51,13 +50,16 @@ func New(l logger.Logger, c Config) *Runner {
 }
 
 type Runner struct {
-	logger        logger.Logger
-	conf          Config
-	mu            sync.Mutex
-	listener      net.Listener
-	started, done chan struct{}
+	logger   logger.Logger
+	conf     Config
+	mu       sync.Mutex
+	listener net.Listener
+	started,
+	done,
+	interrupt chan struct{}
 	startedOnce,
-	closedOnce sync.Once
+	closedOnce,
+	interruptOnce sync.Once
 	server  *rpc.Server
 	mux     *http.ServeMux
 	clients map[int]*clientResult
@@ -106,6 +108,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	go http.Serve(l, r.mux)
 
 	<-r.done
+	r.logger.Debug("runner done")
 	return nil
 }
 
@@ -125,16 +128,25 @@ func (r *Runner) Done() <-chan struct{} {
 	return r.done
 }
 
+// Interrupts all clients, triggering graceful shutdown
 func (r *Runner) Interrupt() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	panic("unimplemented")
+	r.interruptOnce.Do(func() {
+		close(r.interrupt)
+	})
+	return nil
 }
 
+// Stops the RPC server, allowing Run to return immediately
 func (r *Runner) Terminate() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	panic("unimplemented")
+
+	r.closedOnce.Do(func() {
+		close(r.done)
+	})
+	return nil
 }
 
 func (r *Runner) WaitStatus() process.WaitStatus {
@@ -169,7 +181,7 @@ type RunState string
 const (
 	RunStateWait      RunState = "wait"
 	RunStateGo        RunState = "go"
-	RunStateTerminate RunState = "terminate"
+	RunStateInterrupt RunState = "interrupt"
 )
 
 func (r *Runner) WriteLogs(args Logs, reply *Empty) error {
@@ -224,6 +236,16 @@ func (r *Runner) Status(id int, reply *RunState) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	select {
+	case <-r.done:
+		return rpc.ErrShutdown
+	case <-r.interrupt:
+		*reply = RunStateInterrupt
+		return nil
+	default:
+		// continue
+	}
+
 	switch id {
 	case checkoutContainerID:
 		*reply = RunStateGo
@@ -254,7 +276,7 @@ func (r *Runner) Status(id int, reply *RunState) error {
 	default:
 		if _, found := r.clients[id]; found {
 			if r.clients[commandContainerID].Exited() {
-				*reply = RunStateTerminate
+				*reply = RunStateInterrupt
 			} else if r.clients[checkoutContainerID].Exited() {
 				*reply = RunStateGo
 			} else {
@@ -321,7 +343,7 @@ func (c *Client) AwaitRunState(desiredState RunState) error {
 	for {
 		var current RunState
 		if err := c.client.Call("Runner.Status", c.ID, &current); err != nil {
-			if desiredState == RunStateTerminate && errors.Is(err, rpc.ErrShutdown) {
+			if desiredState == RunStateInterrupt && errors.Is(err, rpc.ErrShutdown) {
 				return nil
 			}
 			return err
