@@ -17,6 +17,7 @@ import (
 
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/buildkite/agent/v3/process"
+	"github.com/mitchellh/go-ps"
 )
 
 func init() {
@@ -101,6 +102,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	go http.Serve(l, r.mux)
 
 	<-r.done
+	r.killSidecars()
 	return nil
 }
 
@@ -264,6 +266,99 @@ func (r *Runner) Status(id int, reply *RunState) error {
 			*reply = RunStateStart
 		}
 		return nil
+	}
+}
+
+// sends interrupt signals to all sidecar processes, waits 30 seconds, and then
+// sends kill signals
+func (r *Runner) killSidecars() error {
+	getSidecars := func() ([]ps.Process, error) {
+		var sidecars []ps.Process
+
+		pid := os.Getpid()
+		agent, err := ps.FindProcess(pid)
+		if err != nil {
+			return nil, fmt.Errorf("could not find agent process: %w", err)
+		}
+		procs, err := ps.Processes()
+		if err != nil {
+			return nil, fmt.Errorf("error retrieving processes")
+		}
+
+		for _, proc := range procs {
+			if proc.Pid() == 1 {
+				// skip the pause process
+				continue
+			}
+			if proc.Pid() == agent.Pid() || proc.Pid() == agent.PPid() {
+				// skip ourselves and our parent
+				continue
+			}
+			if proc.Executable() == "buildkite-agent" {
+				// skip agents
+				continue
+			}
+			if proc.PPid() == 0 {
+				if err != nil {
+					return nil, fmt.Errorf("could not find process %d: %w", proc.Pid(), err)
+				}
+				sidecars = append(sidecars, proc)
+			}
+		}
+		return sidecars, nil
+	}
+	killAll := func(signal os.Signal) error {
+		sidecars, err := getSidecars()
+		if err != nil {
+			return err
+		}
+		for _, proc := range sidecars {
+			stdproc, err := os.FindProcess(proc.Pid())
+			if err != nil {
+				r.logger.Warn("could not find process %d: %v", proc.Pid(), err)
+				continue
+			}
+			r.logger.Info("sending %s to sidecar process %s", signal.String(), proc.Executable())
+			if err := stdproc.Signal(signal); err != nil {
+				r.logger.Warn("could not signal process %d: %v", proc.Pid(), err)
+				continue
+			}
+		}
+		return nil
+	}
+
+	sidecars, err := getSidecars()
+	if err != nil {
+		return err
+	}
+	// easy out, no sidecars to worry about
+	if len(sidecars) == 0 {
+		return nil
+	} else {
+		if err := killAll(os.Interrupt); err != nil {
+			return err
+		}
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			// time's up
+			return killAll(os.Kill)
+		case <-ticker.C:
+			// check to see if sidecars have exited yet
+			sidecars, err := getSidecars()
+			if err != nil {
+				return fmt.Errorf("error retrieving processes")
+			}
+			if len(sidecars) == 0 {
+				r.logger.Info("all sidecars have exited")
+				return nil
+			}
+		}
 	}
 }
 
